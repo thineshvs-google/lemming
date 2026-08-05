@@ -24,10 +24,13 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/openconfig/lemming/dataplane/dplaneopts"
 	"github.com/openconfig/lemming/dataplane/forwarding/fwdconfig"
+	"github.com/openconfig/lemming/dataplane/forwarding/fwdtable/bridge"
 	"github.com/openconfig/lemming/dataplane/forwarding/infra/fwdcontext"
 	"github.com/openconfig/lemming/dataplane/saiserver/attrmgr"
 
@@ -45,6 +48,7 @@ type saiSwitch struct {
 	vlan            *vlan
 	stp             *stp
 	bridge          *bridge
+	fdb             *fdb
 	hostif          *hostif
 	hash            *hash
 	isolationGroup  *isolationGroup
@@ -459,6 +463,13 @@ func (sw *saiSwitch) CreateSwitch(ctx context.Context, _ *saipb.CreateSwitchRequ
 	}
 	if _, err := sw.dataplane.TableCreate(ctx, fdbReq); err != nil {
 		return nil, err
+	}
+	if fwdCtx, err := sw.dataplane.FindContext(&fwdpb.ContextId{Id: sw.dataplane.ID()}); err == nil {
+		if obj, err := fwdCtx.Objects.FindID(&fwdpb.ObjectId{Id: FDBTable}); err == nil {
+			if brTable, ok := obj.(*bridge.Table); ok {
+				brTable.SetLearnCallback(sw.onBridgeLearn)
+			}
+		}
 	}
 	floodReq := &fwdpb.TableCreateRequest{
 		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
@@ -1262,6 +1273,56 @@ func (sw *saiSwitch) PortStateChangeNotification(_ *saipb.PortStateChangeNotific
 			}
 		}
 	}
+}
+
+func (sw *saiSwitch) FdbEventNotification(_ *saipb.FdbEventNotificationRequest, srv grpc.ServerStreamingServer[saipb.FdbEventNotificationResponse]) error {
+	if sw.fdb == nil {
+		return status.Error(codes.Unimplemented, "FDB notification service unavailable")
+	}
+	ch := make(chan *saipb.FdbEventNotificationResponse, 100)
+	unsubscribe := sw.fdb.subscribe(ch)
+	defer unsubscribe()
+
+	for {
+		select {
+		case <-srv.Context().Done():
+			return srv.Context().Err()
+		case resp, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if err := srv.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (sw *saiSwitch) onBridgeLearn(mac []byte, portID string) {
+	if sw.fdb == nil {
+		return
+	}
+	portNum, err := strconv.ParseUint(portID, 10, 64)
+	if err != nil {
+		slog.Warn("onBridgeLearn: failed to parse numeric port ID", "portID", portID, "err", err)
+		return
+	}
+	sw.fdb.sendNotification(&saipb.FdbEventNotificationData{
+		EventType: saipb.FdbEvent_FDB_EVENT_LEARNED,
+		FdbEntry: &saipb.FdbEntry{
+			MacAddress: mac,
+		},
+		Attrs: []*saipb.FdbEntryAttribute{
+			{
+				AttributeId: proto.Int32(int32(saipb.FdbEntryAttr_FDB_ENTRY_ATTR_BRIDGE_PORT_ID)),
+				Value: &saipb.AttributeValue{
+					Value: &saipb.AttributeValue_Oid{
+						Oid: portNum,
+					},
+				},
+			},
+		},
+	})
 }
 
 func (sw *saiSwitch) Reset() {
